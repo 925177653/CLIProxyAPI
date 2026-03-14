@@ -567,7 +567,7 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 	if lastErr != nil {
 		return cliproxyexecutor.Response{}, lastErr
 	}
-	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+	return cliproxyexecutor.Response{}, &Error{Code: "service_unavailable", Message: "no auth available", HTTPStatus: 503}
 }
 
 // ExecuteStream performs a streaming execution using the configured selector and executor.
@@ -598,7 +598,7 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	return nil, &Error{Code: "service_unavailable", Message: "no auth available", HTTPStatus: 503}
 }
 
 func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (cliproxyexecutor.Response, error) {
@@ -614,7 +614,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
-			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+			return cliproxyexecutor.Response{}, &Error{Code: "service_unavailable", Message: "no auth available", HTTPStatus: 503}
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
@@ -676,7 +676,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
-			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
+			return cliproxyexecutor.Response{}, &Error{Code: "service_unavailable", Message: "no auth available", HTTPStatus: 503}
 		}
 		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
 		if errPick != nil {
@@ -1280,22 +1280,40 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 
 				statusCode := statusCodeFromResult(result.Error)
+				// Check if there are alternative auths available for this provider+model
+				hasAlternativeAuth := m.hasAlternativeAuthLocked(auth.ID, result.Provider, result.Model)
 				switch statusCode {
 				case 401:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "unauthorized"
-					shouldSuspendModel = true
+					// Only apply cooldown if alternative auth exists
+					if hasAlternativeAuth {
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "unauthorized"
+						shouldSuspendModel = true
+					} else {
+						// Single auth scenario: don't self-destruct, return 503 instead
+						state.NextRetryAfter = time.Time{}
+					}
 				case 402, 403:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "payment_required"
-					shouldSuspendModel = true
+					// Only apply cooldown if alternative auth exists
+					if hasAlternativeAuth {
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "payment_required"
+						shouldSuspendModel = true
+					} else {
+						state.NextRetryAfter = time.Time{}
+					}
 				case 404:
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "not_found"
-					shouldSuspendModel = true
+					// Only apply cooldown if alternative auth exists
+					if hasAlternativeAuth {
+						next := now.Add(12 * time.Hour)
+						state.NextRetryAfter = next
+						suspendReason = "not_found"
+						shouldSuspendModel = true
+					} else {
+						state.NextRetryAfter = time.Time{}
+					}
 				case 429:
 					var next time.Time
 					backoffLevel := state.Quota.BackoffLevel
@@ -1308,22 +1326,33 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 						backoffLevel = nextLevel
 					}
-					state.NextRetryAfter = next
-					state.Quota = QuotaState{
-						Exceeded:      true,
-						Reason:        "quota",
-						NextRecoverAt: next,
-						BackoffLevel:  backoffLevel,
+					// Only apply cooldown if alternative auth exists
+					if hasAlternativeAuth {
+						state.NextRetryAfter = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
+					} else {
+						// Single auth scenario: clear cooldown to avoid self-destruct
+						state.NextRetryAfter = time.Time{}
+						state.Quota = QuotaState{}
 					}
-					suspendReason = "quota"
-					shouldSuspendModel = true
-					setModelQuota = true
 				case 408, 500, 502, 503, 504:
 					if quotaCooldownDisabledForAuth(auth) {
 						state.NextRetryAfter = time.Time{}
-					} else {
+					} else if hasAlternativeAuth {
+						// Only apply cooldown if alternative auth exists
 						next := now.Add(1 * time.Minute)
 						state.NextRetryAfter = next
+					} else {
+						// Single auth scenario: don't apply cooldown
+						state.NextRetryAfter = time.Time{}
 					}
 				default:
 					state.NextRetryAfter = time.Time{}
@@ -1382,6 +1411,45 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.LastError = nil
 	state.Quota = QuotaState{}
 	state.UpdatedAt = now
+}
+// hasAlternativeAuthLocked checks if there are alternative auths available for the same provider+model.
+// This function must be called with m.mu held (either RLock or Lock).
+func (m *Manager) hasAlternativeAuthLocked(currentAuthID, provider, model string) bool {
+	if m == nil || len(m.auths) <= 1 {
+		return false
+	}
+	providerKey := strings.TrimSpace(strings.ToLower(provider))
+	if providerKey == "" {
+		return false
+	}
+	modelKey := strings.TrimSpace(model)
+	if modelKey != "" {
+		parsed := thinking.ParseSuffix(modelKey)
+		if parsed.ModelName != "" {
+			modelKey = strings.TrimSpace(parsed.ModelName)
+		}
+	}
+	registryRef := registry.GetGlobalRegistry()
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if candidate.ID == currentAuthID {
+			continue
+		}
+		candidateProvider := strings.TrimSpace(strings.ToLower(candidate.Provider))
+		if candidateProvider != providerKey {
+			continue
+		}
+		if _, ok := m.executors[candidateProvider]; !ok {
+			continue
+		}
+		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {

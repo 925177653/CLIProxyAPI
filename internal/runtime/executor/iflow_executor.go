@@ -29,6 +29,7 @@ import (
 const (
 	iflowDefaultEndpoint = "/chat/completions"
 	iflowUserAgent       = "iFlow-Cli"
+	iflowMaxRetries     = 1 // Maximum retries for 406 fallback
 )
 
 // IFlowExecutor executes OpenAI-compatible chat completions against the iFlow API using API keys derived from OAuth.
@@ -115,7 +116,7 @@ func (e *IFlowExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if err != nil {
 		return resp, err
 	}
-	applyIFlowHeaders(httpReq, apiKey, false)
+	applyIFlowHeaders(httpReq, apiKey, false, true)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -147,7 +148,50 @@ func (e *IFlowExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}()
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+	// 406 fallback: retry without signature header (only once)
+	if httpResp.StatusCode == http.StatusNotAcceptable {
+		b, _ := io.ReadAll(httpResp.Body)
+		appendAPIResponseChunk(ctx, e.cfg, b)
+		logWithRequestID(ctx).Warnf("iflow executor: got 406, retrying without signature")
+
+		// Retry without signature
+		httpReq2, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return resp, err
+		}
+		// Use includeSignature=false for retry
+		applyIFlowHeaders(httpReq2, apiKey, false, false)
+		logWithRequestID(ctx).Debugf("iflow executor: retrying request without signature")
+
+		httpResp2, err := httpClient.Do(httpReq2)
+		if err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
+		defer func() {
+			if errClose := httpResp2.Body.Close(); errClose != nil {
+				log.Errorf("iflow executor: close response body error: %v", errClose)
+			}
+		}()
+
+		recordAPIResponseMetadata(ctx, e.cfg, httpResp2.StatusCode, httpResp2.Header.Clone())
+
+		if httpResp2.StatusCode < 200 || httpResp2.StatusCode >= 300 {
+			b2, _ := io.ReadAll(httpResp2.Body)
+			appendAPIResponseChunk(ctx, e.cfg, b2)
+			logWithRequestID(ctx).Debugf("iflow executor: retry error, status: %d, message: %s", httpResp2.StatusCode, summarizeErrorBody(httpResp2.Header.Get("Content-Type"), b2))
+			err = statusErr{code: httpResp2.StatusCode, msg: string(b2)}
+			return resp, err
+		}
+
+		data, err := io.ReadAll(httpResp2.Body)
+		if err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
+		appendAPIResponseChunk(ctx, e.cfg, data)
+		httpResp = httpResp2
+	} else if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
@@ -223,7 +267,7 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	if err != nil {
 		return nil, err
 	}
-	applyIFlowHeaders(httpReq, apiKey, true)
+	applyIFlowHeaders(httpReq, apiKey, true, true)
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -250,7 +294,39 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+	// 406 fallback: retry without signature header (only once)
+	if httpResp.StatusCode == http.StatusNotAcceptable {
+		data, _ := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("iflow executor: close response body error: %v", errClose)
+		}
+		appendAPIResponseChunk(ctx, e.cfg, data)
+		logWithRequestID(ctx).Warnf("iflow executor: got 406 in stream, retrying without signature")
+		// Retry without signature
+		httpReq2, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		// Use includeSignature=false for retry
+		applyIFlowHeaders(httpReq2, apiKey, true, false)
+		logWithRequestID(ctx).Debugf("iflow executor: retrying stream request without signature")
+		httpResp, err = httpClient.Do(httpReq2)
+		if err != nil {
+			recordAPIResponseError(ctx, e.cfg, err)
+			return nil, err
+		}
+		recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			data, _ := io.ReadAll(httpResp.Body)
+			if errClose := httpResp.Body.Close(); errClose != nil {
+				log.Errorf("iflow executor: close response body error: %v", errClose)
+			}
+			appendAPIResponseChunk(ctx, e.cfg, data)
+			logWithRequestID(ctx).Debugf("iflow executor: retry error, status: %d, message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+			err = statusErr{code: httpResp.StatusCode, msg: string(data)}
+			return nil, err
+		}
+	} else if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, _ := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("iflow executor: close response body error: %v", errClose)
@@ -269,12 +345,20 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				log.Errorf("iflow executor: close response body error: %v", errClose)
 			}
 		}()
-
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		hasReceivedFirstChunk := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
+			// Check for empty line (heartbeat)
+			if len(line) == 0 {
+				continue
+			}
+			// Track first chunk received for retry logic
+			if !hasReceivedFirstChunk {
+				hasReceivedFirstChunk = true
+			}
 			appendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := parseOpenAIStreamUsage(line); ok {
 				reporter.publish(ctx, detail)
@@ -285,9 +369,16 @@ func (e *IFlowExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
-			recordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			// If we haven't received any chunk yet, this is a "first chunk failure"
+			if !hasReceivedFirstChunk {
+				logWithRequestID(ctx).Warnf("iflow executor: first chunk failure, scanner error: %v", errScan)
+				reporter.publishFailure(ctx)
+				out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			} else {
+				recordAPIResponseError(ctx, e.cfg, errScan)
+				reporter.publishFailure(ctx)
+				out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			}
 		}
 		// Guarantee a usage record exists even if the stream never emitted usage data.
 		reporter.ensurePublished(ctx)
@@ -452,7 +543,7 @@ func (e *IFlowExecutor) refreshOAuthBased(ctx context.Context, auth *cliproxyaut
 	return auth, nil
 }
 
-func applyIFlowHeaders(r *http.Request, apiKey string, stream bool) {
+func applyIFlowHeaders(r *http.Request, apiKey string, stream bool, includeSignature bool) {
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+apiKey)
 	r.Header.Set("User-Agent", iflowUserAgent)
@@ -461,20 +552,24 @@ func applyIFlowHeaders(r *http.Request, apiKey string, stream bool) {
 	sessionID := "session-" + generateUUID()
 	r.Header.Set("session-id", sessionID)
 
-	// Generate timestamp and signature
+	// Generate timestamp and signature (only if includeSignature is true)
 	timestamp := time.Now().UnixMilli()
 	r.Header.Set("x-iflow-timestamp", fmt.Sprintf("%d", timestamp))
 
-	signature := createIFlowSignature(iflowUserAgent, sessionID, timestamp, apiKey)
-	if signature != "" {
-		r.Header.Set("x-iflow-signature", signature)
+	if includeSignature {
+		signature := createIFlowSignature(iflowUserAgent, sessionID, timestamp, apiKey)
+		if signature != "" {
+			r.Header.Set("x-iflow-signature", signature)
+		}
 	}
 
-	if stream {
-		r.Header.Set("Accept", "text/event-stream")
-	} else {
-		r.Header.Set("Accept", "application/json")
-	}
+	// Always include conversation-id header (with key, even if empty value)
+	conversationID := "conv-" + generateUUID()
+	r.Header.Set("conversation-id", conversationID)
+
+	// NOTE: Do NOT set Accept header explicitly.
+	// Explicit Accept: text/event-stream triggers intermittent 406 on some upstream nodes.
+	// The upstream will determine the appropriate response format based on the request.
 }
 
 // createIFlowSignature generates HMAC-SHA256 signature for iFlow API requests.
